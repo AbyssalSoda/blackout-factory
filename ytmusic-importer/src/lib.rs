@@ -174,6 +174,50 @@ fn extract_yt_tracks_from_arr(arr: &[Value]) -> Vec<TrackItem> {
         .collect()
 }
 
+const MAX_PAGES: u32 = 200;
+const BASE_DELAY_MS: u64 = 250;   
+const MAX_RETRIES: u32 = 3;
+const RETRY_BASE_DELAY_MS: u64 = 1000;
+
+fn backoff_delay_ms(attempt: u32) -> u64 {
+    RETRY_BASE_DELAY_MS * (1u64 << attempt.min(4)) 
+}
+
+/// Wraps an InnerTube continuation call with retry-on-failure and
+/// retry-on-429, so a transient hiccup doesn't truncate the whole import.
+fn continue_with_retry<F>(mut call: F) -> Result<Value, String>
+where
+    F: FnMut() -> Result<Value, String>,
+{
+    let mut last_err = String::new();
+    for attempt in 0..=MAX_RETRIES {
+        match call() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let is_rate_limited = e.contains("429") || e.contains("HTTP 5");
+                last_err = e;
+                if attempt < MAX_RETRIES {
+                    let delay = if is_rate_limited {
+                        backoff_delay_ms(attempt) * 2 // back off harder on 429/5xx
+                    } else {
+                        backoff_delay_ms(attempt)
+                    };
+                    bex_core::importer::ext::utils::log(&format!(
+                        "ytmusic-importer: continuation attempt {} failed ({}), retrying in {}ms",
+                        attempt + 1, last_err, delay
+                    ));
+                    sleep_ms(delay);
+                }
+            }
+        }
+    }
+    Err(format!("Exhausted retries: {last_err}"))
+}
+
+fn sleep_ms(ms: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
 fn get_all_yt_playlist_tracks(playlist_id: &str) -> Result<Vec<TrackItem>, String> {
     let browse_id = format!("VL{playlist_id}");
     let data = innertube_browse(YT_URL, "WEB", "2.20231219.01.00", &browse_id)?;
@@ -185,16 +229,41 @@ fn get_all_yt_playlist_tracks(playlist_id: &str) -> Result<Vec<TrackItem>, Strin
     let mut cont = playlist_contents(&data)
         .and_then(|c| extract_continuation_token(c));
 
-    // Paginate up to 10 pages (≈ 1000 tracks)
-    for _ in 0..10 {
-        let token = match cont { Some(t) => t, None => break };
-        let cont_data = innertube_continue(&token)?;
+    let mut pages = 0u32;
+    while let Some(token) = cont {
+        pages += 1;
+        if pages > MAX_PAGES {
+            bex_core::importer::ext::utils::log(&format!(
+                "ytmusic-importer: hit MAX_PAGES ({MAX_PAGES}) for playlist {playlist_id}, \
+                 returning {} tracks (truncated)",
+                tracks.len()
+            ));
+            break;
+        }
+
+        // Gentle pacing — don't fire continuations as fast as possible.
+        sleep_ms(BASE_DELAY_MS);
+
+        let cont_result = continue_with_retry(|| innertube_continue(&token));
+        let cont_data = match cont_result {
+            Ok(d) => d,
+            Err(e) => {
+                bex_core::importer::ext::utils::log(&format!(
+                    "ytmusic-importer: giving up on further pages after {} tracks: {e}",
+                    tracks.len()
+                ));
+                break;
+            }
+        };
+
         let items = match continuation_tracks(&cont_data) {
             Some(arr) => arr,
             None => break,
         };
         let new_tracks = extract_yt_tracks_from_arr(items);
-        if new_tracks.is_empty() { break; }
+        if new_tracks.is_empty() {
+            break;
+        }
         cont = extract_continuation_token(items);
         tracks.extend(new_tracks);
     }
